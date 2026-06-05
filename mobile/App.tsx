@@ -89,15 +89,53 @@ function getConfiguredBackendUrl(): string | null {
   return null;
 }
 
-function getBackendUrl(): string {
-  const configured = getConfiguredBackendUrl();
-  if (configured) {
-    return configured;
-  }
+const BACKEND_PROBE_TIMEOUT_MS = 4000;
+let resolvedBackendUrl: string | null = null;
+let backendUrlResolvePromise: Promise<{ url: string; reachable: boolean }> | null =
+  null;
+
+function resetBackendUrlCache(): void {
+  resolvedBackendUrl = null;
+  backendUrlResolvePromise = null;
+}
+
+function collectBackendUrlCandidates(): string[] {
+  const seen = new Set<string>();
+  const candidates: string[] = [];
+  const add = (url: string | null | undefined) => {
+    if (!url?.trim()) {
+      return;
+    }
+    const normalized = url.trim().replace(/\/$/, "");
+    if (seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    candidates.push(normalized);
+  };
 
   const devHost = getMetroDevHost();
   if (devHost) {
-    return `http://${devHost}:${BACKEND_PORT}`;
+    add(`http://${devHost}:${BACKEND_PORT}`);
+  }
+
+  add(getConfiguredBackendUrl());
+
+  if (Platform.OS === "android" && Constants.isDevice === false) {
+    add(`http://10.0.2.2:${BACKEND_PORT}`);
+  }
+
+  if (!Constants.isDevice) {
+    add(`http://127.0.0.1:${BACKEND_PORT}`);
+  }
+
+  return candidates;
+}
+
+function getBackendUrlFallback(): string {
+  const candidates = collectBackendUrlCandidates();
+  if (candidates.length > 0) {
+    return candidates[0];
   }
 
   if (Platform.OS === "android" && Constants.isDevice === false) {
@@ -108,7 +146,83 @@ function getBackendUrl(): string {
     return `http://127.0.0.1:${BACKEND_PORT}`;
   }
 
-  return `http://127.0.0.1:${BACKEND_PORT}`;
+  return getConfiguredBackendUrl() ?? `http://127.0.0.1:${BACKEND_PORT}`;
+}
+
+function getBackendUrl(): string {
+  return resolvedBackendUrl ?? getBackendUrlFallback();
+}
+
+async function probeBackendUrl(baseUrl: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    BACKEND_PROBE_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch(`${baseUrl}/health`, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function resolveBackendUrl(): Promise<{ url: string; reachable: boolean }> {
+  if (resolvedBackendUrl) {
+    return { url: resolvedBackendUrl, reachable: true };
+  }
+
+  if (!backendUrlResolvePromise) {
+    backendUrlResolvePromise = (async () => {
+      for (const candidate of collectBackendUrlCandidates()) {
+        if (await probeBackendUrl(candidate)) {
+          resolvedBackendUrl = candidate;
+          return { url: candidate, reachable: true };
+        }
+      }
+
+      const fallback = getBackendUrlFallback();
+      return { url: fallback, reachable: false };
+    })();
+  }
+
+  return backendUrlResolvePromise;
+}
+
+function useResolvedBackendUrl() {
+  const [backendUrl, setBackendUrl] = useState(() => getBackendUrl());
+  const [backendReachable, setBackendReachable] = useState<boolean | null>(null);
+
+  const refreshBackendUrl = useCallback(async () => {
+    resetBackendUrlCache();
+    const { url, reachable } = await resolveBackendUrl();
+    setBackendUrl(url);
+    setBackendReachable(reachable);
+  }, []);
+
+  useEffect(() => {
+    void refreshBackendUrl();
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      if (nextState === "active") {
+        void refreshBackendUrl();
+      }
+    });
+    return () => subscription.remove();
+  }, [refreshBackendUrl]);
+
+  return { backendUrl, backendReachable, refreshBackendUrl };
+}
+
+function showBackendUnreachableAlert(backend: string): void {
+  Alert.alert(
+    "Cannot reach backend",
+    `Tried ${backend}. On your PC run backend\\start-server.ps1, confirm phone and PC share Wi-Fi, and open ${backend}/health in the phone browser. If that fails, run backend\\allow-firewall.ps1 as Administrator. After changing mobile/.env, run npx expo run:android again.`,
+  );
 }
 
 const FAILURE_MESSAGE =
@@ -834,11 +948,17 @@ function getStatusMessage(status: AppStatus): string | null {
 }
 
 /** Reference video upload (stable). Do not change for live camera unless the shared API contract changes. */
-function uploadVideo(
+async function uploadVideo(
   video: SelectedVideo,
   onUploading: () => void,
   onExtracting: () => void,
 ): Promise<ExtractionResponse> {
+  const { url: backendBase, reachable } = await resolveBackendUrl();
+  if (!reachable) {
+    showBackendUnreachableAlert(backendBase);
+    throw new Error("BACKEND_UNREACHABLE");
+  }
+
   return new Promise((resolve, reject) => {
     const formData = new FormData();
     const name = video.fileName ?? "dance_video.mp4";
@@ -851,7 +971,7 @@ function uploadVideo(
     } as unknown as Blob);
 
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", `${getBackendUrl()}/extract-pose`);
+    xhr.open("POST", `${backendBase}/extract-pose`);
     xhr.timeout = 15 * 60 * 1000;
 
     xhr.upload.onprogress = (event) => {
@@ -1032,8 +1152,12 @@ const PracticeReferenceMusicPlayer = forwardRef<
         });
       },
       stopAndReset() {
-        player.pause();
-        player.currentTime = 0;
+        try {
+          player.pause();
+          player.currentTime = 0;
+        } catch {
+          // Native player may already be released during teardown.
+        }
       },
     }),
     [player],
@@ -1066,8 +1190,6 @@ const PracticeReferenceMusicPlayer = forwardRef<
     return () => {
       statusSubscription.remove();
       playToEndSubscription.remove();
-      player.pause();
-      player.currentTime = 0;
     };
   }, [player, onLoadStateChange, onPlaybackError, onPlayToEnd]);
 
@@ -1148,7 +1270,7 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
   );
 
   const isLoadingReference = loadingReferenceId !== null;
-  const backendUrl = getBackendUrl();
+  const { backendUrl, backendReachable } = useResolvedBackendUrl();
   const canStartPractice =
     sessionState === "ready_to_start" &&
     meetsPracticeStartRequirements(
@@ -2540,7 +2662,10 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
           <Text style={styles.buttonOutlineText}>Back</Text>
         </Pressable>
 
-        <Text style={styles.backendNote}>Backend: {backendUrl}</Text>
+        <Text style={styles.backendNote}>
+          Backend: {backendUrl}
+          {backendReachable === false ? " (unreachable)" : ""}
+        </Text>
       </ScrollView>
     </View>
   );
@@ -2557,6 +2682,7 @@ function ReferenceVideoModeScreen() {
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const processingLock = useRef(false);
   const pendingRecoveryChecked = useRef(false);
+  const { backendUrl, backendReachable } = useResolvedBackendUrl();
 
   function applySelectedVideo(nextVideo: SelectedVideo) {
     resetResults();
@@ -2627,7 +2753,7 @@ function ReferenceVideoModeScreen() {
     setSummaryError(null);
     setJsonSummary(null);
 
-    const url = `${getBackendUrl()}/outputs/${encodeURIComponent(result.output_filename)}`;
+    const url = `${backendUrl}/outputs/${encodeURIComponent(result.output_filename)}`;
 
     try {
       const response = await fetch(url);
@@ -2754,14 +2880,11 @@ function ReferenceVideoModeScreen() {
         console.error("[extract-pose] stack:", error.stack);
       }
       if (
-        technical.includes("Network request failed") ||
-        technical.includes("Network request timed out")
+        technical !== "BACKEND_UNREACHABLE" &&
+        (technical.includes("Network request failed") ||
+          technical.includes("Network request timed out"))
       ) {
-        const backend = getBackendUrl();
-        Alert.alert(
-          "Cannot reach backend",
-          `Tried ${backend}. Start the backend on your PC (backend\\start-server.ps1), use the same Wi-Fi, and open ${backend}/health in the phone browser. If your PC IP changed, update EXPO_PUBLIC_BACKEND_URL in mobile/.env and run npx expo run:android again.`,
-        );
+        showBackendUnreachableAlert(backendUrl);
       }
       setStatus("failed");
     } finally {
@@ -2769,7 +2892,6 @@ function ReferenceVideoModeScreen() {
     }
   }
 
-  const backendUrl = getBackendUrl();
   const meta = result?.video_metadata ?? {};
   const quality = result?.quality ?? {};
   const summary = result?.summary;
@@ -3026,7 +3148,10 @@ function ReferenceVideoModeScreen() {
           </View>
         )}
 
-        <Text style={styles.backendNote}>Backend: {backendUrl}</Text>
+        <Text style={styles.backendNote}>
+          Backend: {backendUrl}
+          {backendReachable === false ? " (unreachable)" : ""}
+        </Text>
       </ScrollView>
     </View>
   );

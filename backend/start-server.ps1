@@ -54,6 +54,9 @@ if (-not $existing) {
 }
 
 Write-Host ""
+Write-Host "If the phone browser cannot open the health URL, run as Administrator:"
+Write-Host "  .\allow-firewall.ps1"
+Write-Host ""
 Write-Host "=== Phone test URL (same Wi-Fi as this PC) ==="
 if ($lanIp) {
     Write-Host "  http://${lanIp}:8000/health"
