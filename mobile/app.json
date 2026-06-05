@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "Dance Pose Extractor",
+    "slug": "dance-pose-extractor",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.dancecoach.poseextractor",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "Allow access to your videos to extract dance pose data.",
+        "NSCameraUsageDescription": "Allow camera access to practice dance moves with your reference."
+      }
+    },
+    "android": {
+      "package": "com.dancecoach.poseextractor",
+      "versionCode": 1,
+      "usesCleartextTraffic": true,
+      "adaptiveIcon": {
+        "backgroundColor": "#ffffff"
+      },
+      "permissions": [
+        "READ_MEDIA_VIDEO",
+        "READ_EXTERNAL_STORAGE",
+        "CAMERA"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow access to your videos to extract dance pose data."
+        }
+      ],
+      "expo-asset",
+      "expo-font",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow camera access to practice dance moves with your reference."
+        }
+      ]
+    ]
+  }
+}

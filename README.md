@@ -1,35 +1,72 @@
 # Dance Pose Extraction MVP
 
-Extract reference pose landmark data from a dance video uploaded from your phone. The backend validates the video, runs MediaPipe pose detection with lighting preprocessing variants, saves JSON output, and reports honest quality metrics. The mobile app uploads the video and shows results and warnings.
+Extract reference pose landmark data from a dance video, then practice along with that reference using the phone’s front camera. The backend validates videos, runs MediaPipe pose detection, saves pose JSON and reference media, and supports live frame capture during practice. The mobile app has two modes: **Reference Video Mode** (upload and extract) and **Practice Mode** (dance along and review post-practice analysis).
+
+> **Developer note:** Reference video extraction is the stable base feature. Practice Mode builds on saved references without changing the extraction pipeline unless explicitly required.
+
+## Reference Video Mode
+
+1. Select a dance video from the phone gallery.
+2. Extract pose data (`POST /extract-pose`).
+3. Backend saves:
+   - **pose JSON** under `backend/outputs/`
+   - **reference video media** under `backend/reference_media/` for music playback in Practice Mode
+
+The app shows reference quality (`excellent` → `failed`), warnings, and a compact JSON summary. Poor videos are marked honestly instead of being treated as good references.
+
+## Practice Mode
+
+1. Load a saved reference.
+2. Allow camera permission.
+3. Stand far enough back for full body visibility.
+4. Run full-body check.
+5. Press **Start Practice**.
+6. Wait for countdown.
+7. Music starts (from the saved reference video).
+8. Dance until the timer ends.
+9. View post-practice analysis.
+
+During practice, a visual pose overlay confirms live detection. No live coaching or scores are shown until the session ends.
+
+### Important notes
+
+- The practice timer matches the reference video duration.
+- Live poses are compared to the reference video timestamp one-to-one.
+- No live coaching is shown yet.
+- Analysis appears after the session ends.
+- Full body must be visible for accurate comparison.
+- Better lighting improves pose detection.
+- Keep the phone stable.
+- Use the front camera only.
 
 ## What this MVP does
 
-- Select a dance video from the phone gallery (Expo React Native)
-- Upload the video to a local FastAPI backend (`POST /extract-pose`)
+- **Reference Video Mode:** select a dance video, upload, extract per-frame pose landmarks, and save JSON + reference media
+- **Practice Mode:** load a saved reference, run a full-body check, practice with reference music, capture live poses, and show post-practice analysis
 - Validate file type, size, duration, resolution, and basic readability (OpenCV)
-- Extract per-frame pose landmarks (MediaPipe Pose Landmarker, with legacy fallback)
-- Try multiple conservative frame preprocessing variants per frame for difficult lighting
-- Save pose JSON under `backend/outputs/` with metadata, quality metrics, and usability checks
-- Show reference quality (`excellent` → `failed`), warnings, and a compact JSON summary in the app
-- Reject or warn on poor videos instead of pretending they are good references
+- Extract poses with MediaPipe Pose Landmarker (Tasks API) and conservative lighting preprocessing variants
+- Save pose JSON with metadata, quality metrics, and usability checks
+- List saved references (`GET /references`) and stream reference video for playback
+- Extract live pose from camera snapshots during practice (`POST /extract-live-pose-frame`)
+- Show reference quality, warnings, practice analysis, and honest limitations in the app
 
 ## What this MVP does not do
 
-- Live camera tracking or real-time coaching
-- Comparing two dances, scoring, or DTW
+- Live coaching or real-time scoring during practice
+- DTW / time-warping alignment between live and reference motion
+- Final or authoritative dance scoring
 - Authentication, database, or cloud storage
 - Export/share flows or advanced UI
-- Dance coaching feedback
 
 ## Architecture
 
 | Layer | Stack |
 |-------|--------|
-| Mobile | Expo React Native, `expo-image-picker` |
+| Mobile | Expo React Native, `expo-image-picker`, `expo-camera`, `expo-video` |
 | Backend | Python FastAPI |
-| Pose | MediaPipe Pose Landmarker (Tasks API, VIDEO mode) |
+| Pose | MediaPipe Pose Landmarker (Tasks API, VIDEO + IMAGE modes) |
 | Video | OpenCV |
-| Output | JSON (`video_metadata`, `quality`, `pose_frames`) |
+| Output | JSON in `backend/outputs/`; reference video copy in `backend/reference_media/` |
 
 ## Repository layout
 
@@ -38,8 +75,9 @@ danceCoachTwo/
 ├── mobile/          # Expo app
 ├── backend/         # FastAPI + pose pipeline
 │   ├── app/
-│   ├── outputs/     # Generated JSON (runtime)
-│   ├── uploads/     # Temporary uploads (deleted after processing)
+│   ├── outputs/          # Generated pose JSON (runtime)
+│   ├── reference_media/  # Saved reference videos for Practice Mode playback
+│   ├── uploads/          # Temporary uploads (deleted after processing)
 │   └── scripts/     # CLI test script
 └── README.md
 ```
@@ -175,11 +213,21 @@ The backend must be running with `--host 0.0.0.0`. Phone and computer must be on
 
 ## Known limitations
 
+### Reference extraction
+
 - Pose extraction may fail with heavy occlusion.
 - Pose extraction may be poor in very dark videos.
 - Fast spins, motion blur, and loose clothing can reduce landmark accuracy.
 - Extreme camera angles can reduce full-body visibility.
-- This MVP extracts reference pose data only. It does not compare dances yet.
+
+### Practice Mode
+
+- This is not final dance scoring.
+- No DTW / time-warping yet.
+- If the user starts late or early relative to the music, the analysis will reflect that.
+- Frame sampling is low-frequency for stability.
+- Fast motion can reduce detection quality.
+- Live poses are compared to reference timestamps one-to-one; timing drift affects results.
 
 ---
 
@@ -189,9 +237,12 @@ The backend must be running with `--host 0.0.0.0`. Phone and computer must be on
 - [x] App uploads to `POST /extract-pose` (`multipart/form-data`, field `file`)
 - [x] Backend validates video before expensive processing
 - [x] Backend extracts poses with preprocessing variants for difficult lighting
-- [x] Backend saves pose JSON safely; uploads are deleted after processing
+- [x] Backend saves pose JSON and reference video media; uploads are deleted after processing
 - [x] App shows metadata, quality, and warnings
 - [x] Poor videos are marked `poor` or `failed` in `reference_quality`, not hidden
+- [x] Practice Mode loads saved references and plays reference music
+- [x] Full-body check before practice; countdown and duration-matched timer
+- [x] Live pose capture during practice with post-session analysis
 
 ## More detail
 
