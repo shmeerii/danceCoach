@@ -29,6 +29,7 @@ import {
   type PracticeAnalysisResult,
 } from "./src/utils/practiceAnalysis";
 import { PoseOverlay } from "./src/components/PoseOverlay";
+import { PracticeAnalysisReport } from "./src/components/PracticeAnalysisReport";
 import type { PoseLandmarkInput } from "./src/utils/poseNormalization";
 
 const BACKEND_PORT = 8000;
@@ -373,6 +374,7 @@ type PracticeSessionState =
   | "checking_full_body"
   | "ready_to_start"
   | "countdown"
+  | "starting_practice"
   | "practicing"
   | "analyzing"
   | "complete"
@@ -416,10 +418,18 @@ const FULL_BODY_FRAME_INTERVAL_MS = 500;
 const PRACTICE_COUNTDOWN_START = 5;
 const PRACTICE_COUNTDOWN_TICK_MS = 1000;
 const PRACTICE_TIMER_TICK_MS = 250;
+const PRACTICE_END_GRACE_MS = 0;
+const MAX_PRACTICE_END_EARLY_MS = 1000;
 const LIVE_FRAME_INTERVAL_MS = 700;
 const LIVE_FRAME_JPEG_QUALITY = 0.55;
-const MAX_CONSECUTIVE_LIVE_POSE_FAILURES = 5;
+const LIVE_POSE_SAMPLING_WARNING_THRESHOLD = 3;
 const MUSIC_PLAYBACK_START_TIMEOUT_MS = 5000;
+const MUSIC_PLAY_COMMAND_SETTLED_MS = 100;
+
+type PracticeEndReason =
+  | "elapsed_duration_reached"
+  | "user_stop"
+  | "user_leave";
 
 const CAMERA_SESSION_STATES: PracticeSessionState[] = [
   "reference_loaded",
@@ -427,6 +437,7 @@ const CAMERA_SESSION_STATES: PracticeSessionState[] = [
   "checking_full_body",
   "ready_to_start",
   "countdown",
+  "starting_practice",
   "practicing",
   "failed",
 ];
@@ -605,58 +616,6 @@ function formatDuration(seconds: number | null | undefined): string {
   return `${minutes}:${secs.toString().padStart(2, "0")}`;
 }
 
-function formatMatchScore(score: number | null): string {
-  if (score === null) {
-    return "Not enough data";
-  }
-  return `${score}/100`;
-}
-
-function describeOverallMatch(score: number | null): string {
-  if (score === null) {
-    return "Not enough clear frames to review your overall match.";
-  }
-  if (score >= 75) {
-    return "You matched the reference well overall.";
-  }
-  if (score >= 50) {
-    return "You matched parts of the reference in several moments.";
-  }
-  return "Your practice highlights useful moments to compare with the reference.";
-}
-
-function describeRegionMatch(
-  region: "arms" | "legs" | "torso",
-  score: number | null,
-): string {
-  if (score === null) {
-    return `Not enough data to review your ${region}.`;
-  }
-  if (score >= 75) {
-    return `Your ${region} were close to the reference.`;
-  }
-  if (score >= 50) {
-    return `Your ${region} matched the reference in several moments.`;
-  }
-  return `Your ${region} need more attention.`;
-}
-
-const PRACTICE_ANALYSIS_TIPS = [
-  "Keep full body visible.",
-  "Improve lighting.",
-  "Move farther back if feet are missing.",
-  "Keep timing with the music.",
-  "Try again with the same reference.",
-] as const;
-
-const MIN_USABLE_COMPARISON_FRAMES_FOR_SCORE = 5;
-
-const INSUFFICIENT_PRACTICE_DATA_TIPS = [
-  "Make sure your full body is visible.",
-  "Use better lighting.",
-  "Complete more of the dance.",
-] as const;
-
 function resolveReferenceDurationSeconds(
   poseJson: OutputJsonPayload,
   catalogDuration: number | null,
@@ -675,6 +634,25 @@ function resolveReferenceDurationSeconds(
     return catalog;
   }
   return 0;
+}
+
+function getPracticeAutoEndThresholdMs(
+  referenceDurationSeconds: number,
+): number {
+  const durationMs = referenceDurationSeconds * 1000;
+  const graceEndMs = durationMs - PRACTICE_END_GRACE_MS;
+  const earliestAllowedEndMs = Math.max(0, durationMs - MAX_PRACTICE_END_EARLY_MS);
+  return Math.max(earliestAllowedEndMs, graceEndMs);
+}
+
+function hasReachedPracticeDuration(
+  startTimeMs: number,
+  referenceDurationSeconds: number,
+): boolean {
+  return (
+    Date.now() - startTimeMs >=
+    getPracticeAutoEndThresholdMs(referenceDurationSeconds)
+  );
 }
 
 function getElapsedPracticeSeconds(
@@ -1095,12 +1073,17 @@ const PracticeReferenceMusicPlayer = forwardRef<
           }
 
           let settled = false;
+          let playCommandSettledId: ReturnType<typeof setTimeout> | null = null;
           const cleanup = (
             playingSubscription: { remove: () => void },
             statusSubscription: { remove: () => void },
           ) => {
             playingSubscription.remove();
             statusSubscription.remove();
+            if (playCommandSettledId !== null) {
+              clearTimeout(playCommandSettledId);
+              playCommandSettledId = null;
+            }
           };
 
           const timeoutId = setTimeout(() => {
@@ -1112,16 +1095,24 @@ const PracticeReferenceMusicPlayer = forwardRef<
             reject(new Error("Reference music did not start in time."));
           }, MUSIC_PLAYBACK_START_TIMEOUT_MS);
 
+          const settleSuccess = (reason: "playing" | "play_command") => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            clearTimeout(timeoutId);
+            cleanup(playingSubscription, statusSubscription);
+            console.log("[practice] music playback confirmed:", reason);
+            resolve();
+          };
+
           const playingSubscription = player.addListener(
             "playingChange",
             ({ isPlaying }) => {
               if (settled || !isPlaying) {
                 return;
               }
-              settled = true;
-              clearTimeout(timeoutId);
-              cleanup(playingSubscription, statusSubscription);
-              resolve();
+              settleSuccess("playing");
             },
           );
 
@@ -1141,14 +1132,31 @@ const PracticeReferenceMusicPlayer = forwardRef<
           );
 
           player.currentTime = 0;
-          player.play();
-
-          if (player.playing) {
+          try {
+            player.play();
+          } catch (playError) {
             settled = true;
             clearTimeout(timeoutId);
             cleanup(playingSubscription, statusSubscription);
-            resolve();
+            reject(
+              playError instanceof Error
+                ? playError
+                : new Error(String(playError)),
+            );
+            return;
           }
+
+          if (player.playing) {
+            settleSuccess("playing");
+            return;
+          }
+
+          playCommandSettledId = setTimeout(() => {
+            if (settled || player.status === "error") {
+              return;
+            }
+            settleSuccess("play_command");
+          }, MUSIC_PLAY_COMMAND_SETTLED_MS);
         });
       },
       stopAndReset() {
@@ -1235,6 +1243,9 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
     useState<ReferenceMusicLoadState>("loading");
   const [practiceElapsedSeconds, setPracticeElapsedSeconds] = useState(0);
   const [sampledFrameCount, setSampledFrameCount] = useState(0);
+  const [livePoseSamplingWarning, setLivePoseSamplingWarning] = useState<
+    string | null
+  >(null);
   const [practiceMusicPlaybackState, setPracticeMusicPlaybackState] =
     useState<PracticeMusicPlaybackState>("idle");
   const [practiceSessionError, setPracticeSessionError] = useState<string | null>(
@@ -1250,13 +1261,12 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
   const practiceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const practiceStartTimeRef = useRef<number | null>(null);
   const referenceDurationSecondsRef = useRef(0);
-  const livePoseCollectionAbortRef = useRef(false);
   const livePoseCollectionRunningRef = useRef(false);
   const livePoseCollectionIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
     null,
   );
   const livePoseRequestInFlightRef = useRef(false);
-  const consecutiveLivePoseFailuresRef = useRef(0);
+  const livePoseSamplingFailuresRef = useRef(0);
   const livePoseFramesRef = useRef<PracticeLivePoseFrame[]>([]);
   const fullBodyPassedRef = useRef(false);
   const completePracticeSessionRef = useRef<() => void>(() => {});
@@ -1264,11 +1274,6 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
   const startPracticeSessionRef = useRef<() => void>(() => {});
   const sessionEndHandledRef = useRef(false);
   const sessionStateRef = useRef<PracticeSessionState>("no_reference");
-  const abortPracticeForMusicErrorRef = useRef<(message: string) => void>(() => {});
-  const abortPracticeForLivePoseFailureRef = useRef<(message: string) => void>(
-    () => {},
-  );
-
   const isLoadingReference = loadingReferenceId !== null;
   const { backendUrl, backendReachable } = useResolvedBackendUrl();
   const canStartPractice =
@@ -1323,6 +1328,11 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
     setCountdownValue(null);
     setPracticeElapsedSeconds(0);
     setPracticeMusicPlaybackState("idle");
+    setLivePoseSamplingWarning(null);
+  }
+
+  function isLivePoseSamplingActive(): boolean {
+    return sessionStateRef.current === "practicing";
   }
 
   function appendLivePoseFrame(frame: PracticeLivePoseFrame) {
@@ -1335,18 +1345,56 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
   }
 
   function stopLivePoseCollection() {
-    livePoseCollectionAbortRef.current = true;
     livePoseCollectionRunningRef.current = false;
     clearLivePoseCollectionTimer();
   }
 
   function resetLivePoseCollection() {
-    livePoseCollectionAbortRef.current = false;
     livePoseCollectionRunningRef.current = false;
     livePoseRequestInFlightRef.current = false;
-    consecutiveLivePoseFailuresRef.current = 0;
+    livePoseSamplingFailuresRef.current = 0;
+    setLivePoseSamplingWarning(null);
     clearLivePoseCollectionTimer();
     clearLivePoseFrames();
+  }
+
+  function appendSkippedLivePoseFrame(
+    elapsedAtCapture: number,
+    clientTimestamp: number,
+    skippedReason: "capture_failed" | "request_failed",
+    latencyMs: number,
+  ) {
+    appendLivePoseFrame({
+      practice_elapsed_seconds: elapsedAtCapture,
+      client_timestamp: clientTimestamp,
+      pose_detected: false,
+      full_body_visible: false,
+      landmarks: [],
+      world_landmarks: [],
+      quality: {},
+      latency_ms: latencyMs,
+      skipped_reason: skippedReason,
+    });
+  }
+
+  function recordLivePoseSamplingFailure(skippedReason: string) {
+    livePoseSamplingFailuresRef.current += 1;
+    if (
+      livePoseSamplingFailuresRef.current >= LIVE_POSE_SAMPLING_WARNING_THRESHOLD
+    ) {
+      setLivePoseSamplingWarning(
+        "Some pose samples are being skipped. Practice continues — we will analyze what was collected.",
+      );
+    }
+    console.warn("[practice] live pose sample skipped (session continues)", {
+      skippedReason,
+      consecutiveSkippedSamples: livePoseSamplingFailuresRef.current,
+    });
+  }
+
+  function clearLivePoseSamplingFailureWarning() {
+    livePoseSamplingFailuresRef.current = 0;
+    setLivePoseSamplingWarning(null);
   }
 
   function stopAllSessionResources() {
@@ -1362,6 +1410,21 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
   }
 
   function leavePracticeMode() {
+    if (sessionStateRef.current === "practicing") {
+      const startTimeMs = practiceStartTimeRef.current;
+      const durationSeconds = referenceDurationSecondsRef.current;
+      const elapsedSeconds =
+        startTimeMs === null
+          ? 0
+          : getElapsedPracticeSeconds(startTimeMs, durationSeconds);
+      console.log("[practice] session ended", {
+        reason: "user_leave",
+        practiceStartTime: startTimeMs,
+        referenceDurationSeconds: durationSeconds,
+        elapsedSeconds,
+        completedFully: false,
+      });
+    }
     stopAllSessionResources();
     resetPracticeAttemptUI();
     clearStoredPracticeResults();
@@ -1372,7 +1435,8 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
     setSessionState("complete");
   }, []);
 
-  const enterAnalyzing = useCallback((completedFully: boolean) => {
+  const enterAnalyzing = useCallback(
+    (completedFully: boolean, reason: PracticeEndReason) => {
     if (sessionEndHandledRef.current) {
       return;
     }
@@ -1385,6 +1449,20 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
         ? 0
         : getElapsedPracticeSeconds(startTimeMs, durationSeconds);
 
+    console.log("[practice] session ended", {
+      reason,
+      practiceStartTime: startTimeMs,
+      referenceDurationSeconds: durationSeconds,
+      elapsedSeconds,
+      elapsedMs: startTimeMs === null ? 0 : Date.now() - startTimeMs,
+      autoEndThresholdMs:
+        durationSeconds > 0
+          ? getPracticeAutoEndThresholdMs(durationSeconds)
+          : null,
+      completedFully,
+    });
+
+    sessionStateRef.current = "analyzing";
     clearPracticeTimer();
     clearCountdownTimer();
     stopLivePoseCollection();
@@ -1392,6 +1470,7 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
     practiceStartTimeRef.current = null;
     referenceDurationSecondsRef.current = 0;
     setPracticeMusicPlaybackState("idle");
+    setLivePoseSamplingWarning(null);
 
     setPracticeElapsedSeconds(elapsedSeconds);
     setCompletedSessionSummary({
@@ -1401,7 +1480,8 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
       completedFully,
     });
     setSessionState("analyzing");
-  }, []);
+  },
+  []);
 
   const resetForRetry = useCallback(() => {
     stopAllSessionResources();
@@ -1412,48 +1492,8 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
     setSessionState("camera_ready");
   }, []);
 
-  const abortPracticeForMusicError = useCallback((message: string) => {
-    if (sessionStateRef.current !== "practicing") {
-      return;
-    }
-    if (sessionEndHandledRef.current) {
-      return;
-    }
-    sessionEndHandledRef.current = true;
-
-    clearPracticeTimer();
-    clearCountdownTimer();
-    stopLivePoseCollection();
-    musicPlayerRef.current?.stopAndReset();
-    practiceStartTimeRef.current = null;
-    referenceDurationSecondsRef.current = 0;
-    setPracticeMusicPlaybackState("error");
-    setPracticeSessionError(message);
-    setSessionState("failed");
-  }, []);
-
-  const abortPracticeForLivePoseFailure = useCallback((message: string) => {
-    if (sessionStateRef.current !== "practicing") {
-      return;
-    }
-    if (sessionEndHandledRef.current) {
-      return;
-    }
-    sessionEndHandledRef.current = true;
-
-    clearPracticeTimer();
-    clearCountdownTimer();
-    stopLivePoseCollection();
-    musicPlayerRef.current?.stopAndReset();
-    practiceStartTimeRef.current = null;
-    referenceDurationSecondsRef.current = 0;
-    setPracticeMusicPlaybackState("idle");
-    setPracticeSessionError(message);
-    setSessionState("failed");
-  }, []);
-
   const completePracticeSession = useCallback(() => {
-    enterAnalyzing(true);
+    enterAnalyzing(true, "elapsed_duration_reached");
   }, [enterAnalyzing]);
 
   const failPracticeStart = useCallback((message: string) => {
@@ -1464,12 +1504,21 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
     referenceDurationSecondsRef.current = 0;
     setPracticeMusicPlaybackState("idle");
     setPracticeSessionError(message);
-    setSessionState(
-      fullBodyPassedRef.current ? "ready_to_start" : "camera_ready",
-    );
+    const nextState = fullBodyPassedRef.current
+      ? "ready_to_start"
+      : "camera_ready";
+    sessionStateRef.current = nextState;
+    setSessionState(nextState);
   }, []);
 
   const startPracticeSession = useCallback(async () => {
+    if (sessionStateRef.current !== "starting_practice") {
+      return;
+    }
+    if (practiceStartTimeRef.current !== null) {
+      return;
+    }
+
     if (!loadedReference) {
       failPracticeStart("No reference loaded.");
       return;
@@ -1514,16 +1563,30 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
       const technical =
         error instanceof Error ? error.message : String(error);
       console.error("[practice] music failed to start:", technical);
+      console.log("[practice] practice failed to start", {
+        reason: "music_start_failed",
+        practiceStartTime: practiceStartTimeRef.current,
+        referenceDurationSeconds: referenceDurationSecondsRef.current,
+        technical,
+      });
       musicPlayerRef.current?.stopAndReset();
       setPracticeMusicPlaybackState("idle");
       setPracticeSessionError(
         "Reference music could not start. Check your connection and try again.",
       );
+      sessionStateRef.current = "ready_to_start";
       setSessionState("ready_to_start");
       return;
     }
 
     practiceStartTimeRef.current = Date.now();
+    sessionStateRef.current = "practicing";
+    setSessionState("practicing");
+    console.log("[practice] session started", {
+      practiceStartTime: practiceStartTimeRef.current,
+      referenceDurationSeconds: referenceDurationSecondsRef.current,
+      autoEndThresholdMs: getPracticeAutoEndThresholdMs(durationSeconds),
+    });
     setPracticeMusicPlaybackState("playing");
     startLivePoseCollectionRef.current();
     practiceTimerRef.current = setInterval(() => {
@@ -1538,7 +1601,7 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
         referenceDuration,
       );
       setSampledFrameCount(livePoseFramesRef.current.length);
-      if (elapsedSeconds >= referenceDuration) {
+      if (hasReachedPracticeDuration(startTimeMs, referenceDuration)) {
         setPracticeElapsedSeconds(referenceDuration);
         completePracticeSessionRef.current();
         return;
@@ -1561,34 +1624,63 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
     sessionStateRef.current = sessionState;
   }, [sessionState]);
 
-  useEffect(() => {
-    abortPracticeForMusicErrorRef.current = abortPracticeForMusicError;
-  }, [abortPracticeForMusicError]);
-
-  useEffect(() => {
-    abortPracticeForLivePoseFailureRef.current = abortPracticeForLivePoseFailure;
-  }, [abortPracticeForLivePoseFailure]);
+  const handleMusicLoadStateChange = useCallback(
+    (state: ReferenceMusicLoadState) => {
+      if (
+        (sessionStateRef.current === "practicing" ||
+          sessionStateRef.current === "starting_practice") &&
+        (state === "loading" || state === "error")
+      ) {
+        console.warn(
+          "[practice] ignoring transient music load state during active session:",
+          state,
+        );
+        return;
+      }
+      setMusicLoadState(state);
+    },
+    [],
+  );
 
   const handleMusicPlaybackError = useCallback(() => {
-    if (sessionStateRef.current !== "practicing") {
+    if (sessionStateRef.current === "practicing") {
+      console.error(
+        "[practice] hard music playback error during practice; timer continues until reference duration",
+      );
+      setPracticeMusicPlaybackState("error");
       return;
     }
-    if (practiceStartTimeRef.current === null) {
-      return;
+    if (
+      sessionStateRef.current === "countdown" ||
+      sessionStateRef.current === "starting_practice"
+    ) {
+      clearCountdownTimer();
+      setCountdownValue(null);
+      musicPlayerRef.current?.stopAndReset();
+      setPracticeMusicPlaybackState("idle");
+      setPracticeSessionError(
+        "Reference music failed before practice could start. Try again.",
+      );
+      sessionStateRef.current = "ready_to_start";
+      setSessionState("ready_to_start");
+      console.log("[practice] cancelled due to music error before practice start");
     }
-    abortPracticeForMusicErrorRef.current(
-      "Reference music stopped unexpectedly. Your practice session was ended to keep timing accurate.",
-    );
   }, []);
 
   const handleMusicPlayToEnd = useCallback(() => {
     if (sessionStateRef.current !== "practicing") {
       return;
     }
-    if (sessionEndHandledRef.current) {
-      return;
-    }
-    completePracticeSessionRef.current();
+    console.log(
+      "[practice] reference media ended naturally; timer continues until reference duration",
+      {
+        referenceDurationSeconds: referenceDurationSecondsRef.current,
+        elapsedSeconds: getElapsedPracticeSeconds(
+          practiceStartTimeRef.current,
+          referenceDurationSecondsRef.current,
+        ),
+      },
+    );
   }, []);
 
   useEffect(() => {
@@ -1604,6 +1696,10 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
       livePoseFrames: completedSessionSummary.livePoseFrames,
       referenceDurationSeconds:
         completedSessionSummary.referenceDurationSeconds,
+      referenceQuality: loadedReference.poseJson.quality ?? {
+        reference_quality: loadedReference.referenceQuality,
+        pose_detection_percentage: loadedReference.poseDetectionPercentage,
+      },
     });
 
     setPracticeAnalysisResult(analysis);
@@ -1680,7 +1776,8 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
           return null;
         }
         if (current <= 1) {
-          setSessionState("practicing");
+          sessionStateRef.current = "starting_practice";
+          setSessionState("starting_practice");
           startPracticeSessionRef.current();
           return null;
         }
@@ -1693,7 +1790,7 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
     };
   }, [sessionState, countdownValue]);
 
-  async function captureAndSendLivePoseFrame(): Promise<LivePoseFrameResponse> {
+  async function captureLivePosePhoto(): Promise<string> {
     if (!cameraRef.current) {
       throw new Error("Camera is not available.");
     }
@@ -1707,9 +1804,15 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
       throw new Error("Could not capture a camera frame.");
     }
 
+    return photo.uri;
+  }
+
+  async function requestLivePoseFromPhoto(
+    photoUri: string,
+  ): Promise<LivePoseFrameResponse> {
     const formData = new FormData();
     formData.append("file", {
-      uri: photo.uri,
+      uri: photoUri,
       name: "practice_frame.jpg",
       type: "image/jpeg",
     } as unknown as Blob);
@@ -1735,22 +1838,19 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
     }
   }
 
+  async function captureAndSendLivePoseFrame(): Promise<LivePoseFrameResponse> {
+    const photoUri = await captureLivePosePhoto();
+    return requestLivePoseFromPhoto(photoUri);
+  }
+
   const processLivePoseCapture = useCallback(async () => {
-    if (livePoseCollectionAbortRef.current) {
+    if (!isLivePoseSamplingActive()) {
       return;
     }
 
     const startTimeMs = practiceStartTimeRef.current;
     const referenceDuration = referenceDurationSecondsRef.current;
     if (startTimeMs === null || referenceDuration <= 0) {
-      return;
-    }
-
-    const practiceElapsedSeconds = getElapsedPracticeSeconds(
-      startTimeMs,
-      referenceDuration,
-    );
-    if (practiceElapsedSeconds >= referenceDuration) {
       return;
     }
 
@@ -1764,58 +1864,69 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
       startTimeMs,
       referenceDuration,
     );
-    const requestStartedAt = Date.now();
+    const sampleStartedAt = Date.now();
 
     try {
-      const payload = await captureAndSendLivePoseFrame();
-      const latencyMs = Date.now() - requestStartedAt;
-
-      if (livePoseCollectionAbortRef.current) {
-        return;
-      }
-
-      consecutiveLivePoseFailuresRef.current = 0;
-      appendLivePoseFrame({
-        practice_elapsed_seconds: elapsedAtCapture,
-        client_timestamp: clientTimestamp,
-        pose_detected: payload.pose_detected,
-        full_body_visible: payload.quality?.full_body_visible ?? false,
-        landmarks: payload.landmarks ?? [],
-        world_landmarks: payload.world_landmarks ?? [],
-        quality: (payload.quality ?? {}) as Record<string, unknown>,
-        latency_ms: latencyMs,
-        skipped_reason: null,
-      });
-    } catch (error) {
-      const latencyMs = Date.now() - requestStartedAt;
-      if (livePoseCollectionAbortRef.current) {
-        return;
-      }
-
-      const technical =
-        error instanceof Error ? error.message : String(error);
-      console.error("[practice] live pose frame failed:", technical);
-
-      appendLivePoseFrame({
-        practice_elapsed_seconds: elapsedAtCapture,
-        client_timestamp: clientTimestamp,
-        pose_detected: false,
-        full_body_visible: false,
-        landmarks: [],
-        world_landmarks: [],
-        quality: {},
-        latency_ms: latencyMs,
-        skipped_reason: "request_failed",
-      });
-
-      consecutiveLivePoseFailuresRef.current += 1;
-      if (
-        consecutiveLivePoseFailuresRef.current >=
-        MAX_CONSECUTIVE_LIVE_POSE_FAILURES
-      ) {
-        abortPracticeForLivePoseFailureRef.current(
-          "Practice stopped because live pose extraction stopped responding.",
+      let photoUri: string;
+      try {
+        photoUri = await captureLivePosePhoto();
+      } catch (error) {
+        const latencyMs = Date.now() - sampleStartedAt;
+        if (!isLivePoseSamplingActive()) {
+          return;
+        }
+        const technical =
+          error instanceof Error ? error.message : String(error);
+        console.error("[practice] camera capture failed:", technical);
+        appendSkippedLivePoseFrame(
+          elapsedAtCapture,
+          clientTimestamp,
+          "capture_failed",
+          latencyMs,
         );
+        recordLivePoseSamplingFailure("capture_failed");
+        return;
+      }
+
+      if (!isLivePoseSamplingActive()) {
+        return;
+      }
+
+      try {
+        const payload = await requestLivePoseFromPhoto(photoUri);
+        const latencyMs = Date.now() - sampleStartedAt;
+
+        if (!isLivePoseSamplingActive()) {
+          return;
+        }
+
+        clearLivePoseSamplingFailureWarning();
+        appendLivePoseFrame({
+          practice_elapsed_seconds: elapsedAtCapture,
+          client_timestamp: clientTimestamp,
+          pose_detected: payload.pose_detected,
+          full_body_visible: payload.quality?.full_body_visible ?? false,
+          landmarks: payload.landmarks ?? [],
+          world_landmarks: payload.world_landmarks ?? [],
+          quality: (payload.quality ?? {}) as Record<string, unknown>,
+          latency_ms: latencyMs,
+          skipped_reason: null,
+        });
+      } catch (error) {
+        const latencyMs = Date.now() - sampleStartedAt;
+        if (!isLivePoseSamplingActive()) {
+          return;
+        }
+        const technical =
+          error instanceof Error ? error.message : String(error);
+        console.error("[practice] live pose backend request failed:", technical);
+        appendSkippedLivePoseFrame(
+          elapsedAtCapture,
+          clientTimestamp,
+          "request_failed",
+          latencyMs,
+        );
+        recordLivePoseSamplingFailure("request_failed");
       }
     } finally {
       livePoseRequestInFlightRef.current = false;
@@ -1824,29 +1935,14 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
 
   const startLivePoseCollection = useCallback(() => {
     clearLivePoseFrames();
-    livePoseCollectionAbortRef.current = false;
     livePoseCollectionRunningRef.current = true;
     livePoseRequestInFlightRef.current = false;
-    consecutiveLivePoseFailuresRef.current = 0;
+    livePoseSamplingFailuresRef.current = 0;
+    setLivePoseSamplingWarning(null);
     clearLivePoseCollectionTimer();
 
     livePoseCollectionIntervalRef.current = setInterval(() => {
-      if (livePoseCollectionAbortRef.current) {
-        clearLivePoseCollectionTimer();
-        return;
-      }
-
-      const startTimeMs = practiceStartTimeRef.current;
-      const referenceDuration = referenceDurationSecondsRef.current;
-      if (startTimeMs === null || referenceDuration <= 0) {
-        return;
-      }
-
-      const elapsedSeconds = getElapsedPracticeSeconds(
-        startTimeMs,
-        referenceDuration,
-      );
-      if (elapsedSeconds >= referenceDuration) {
+      if (!isLivePoseSamplingActive()) {
         clearLivePoseCollectionTimer();
         return;
       }
@@ -1954,7 +2050,7 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
     if (sessionState !== "practicing") {
       return;
     }
-    enterAnalyzing(false);
+    enterAnalyzing(false, "user_stop");
   }
 
   function handleLeavePractice() {
@@ -2108,9 +2204,9 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
         <StatusBar style="dark" />
         <View style={styles.practiceAnalyzingContainer}>
           <ActivityIndicator size="large" color="#1a4d8f" />
-          <Text style={styles.practiceAnalyzingTitle}>Analyzing session</Text>
+          <Text style={styles.practiceAnalyzingTitle}>Preparing your review</Text>
           <Text style={styles.practiceAnalyzingText}>
-            Comparing your practice to the reference…
+            Putting together friendly feedback from your run…
           </Text>
         </View>
       </View>
@@ -2125,15 +2221,6 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
   ) {
     const analysis = practiceAnalysisResult;
     const stoppedEarly = !completedSessionSummary.completedFully;
-    const hasEnoughDataForScores =
-      analysis.usable_comparison_frames >= MIN_USABLE_COMPARISON_FRAMES_FOR_SCORE;
-    const baseTips = new Set<string>(PRACTICE_ANALYSIS_TIPS);
-    const analysisTips = hasEnoughDataForScores
-      ? [
-          ...PRACTICE_ANALYSIS_TIPS,
-          ...analysis.tips.filter((tip) => !baseTips.has(tip)),
-        ]
-      : [...INSUFFICIENT_PRACTICE_DATA_TIPS];
 
     return (
       <View style={styles.container}>
@@ -2142,120 +2229,12 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
           contentContainerStyle={styles.scrollContent}
           keyboardShouldPersistTaps="handled"
         >
-          <Text style={styles.title}>Practice Analysis</Text>
-          <Text style={styles.instruction}>
-            A friendly review of how your practice compared to the reference.
-            This is not a final score.
-          </Text>
+          <Text style={styles.title}>Your practice review</Text>
 
-          {stoppedEarly && (
-            <View style={styles.practiceAnalysisNotice}>
-              <Text style={styles.referenceListItemMeta}>
-                Practice stopped early. Analysis is based only on the part you
-                completed.
-              </Text>
-            </View>
-          )}
-
-          {!hasEnoughDataForScores ? (
-            <>
-              <View style={styles.summaryBox}>
-                <Text style={styles.sectionTitle}>Analysis</Text>
-                <Text style={styles.referenceListItemMeta}>
-                  Not enough usable pose data for analysis.
-                </Text>
-                <Text style={styles.referenceListItemMeta}>
-                  Usable comparison frames: {analysis.usable_comparison_frames}
-                </Text>
-                {analysis.skipped_frames.partial_body > 0 && (
-                  <Text style={styles.referenceListItemMeta}>
-                    Frames skipped (body not fully visible):{" "}
-                    {analysis.skipped_frames.partial_body}
-                  </Text>
-                )}
-              </View>
-
-              <View style={styles.summaryBox}>
-                <Text style={styles.sectionTitle}>Tips</Text>
-                {analysisTips.map((tip) => (
-                  <Text key={tip} style={styles.practiceAnalysisTip}>
-                    • {tip}
-                  </Text>
-                ))}
-              </View>
-            </>
-          ) : (
-            <>
-              <View style={styles.summaryBox}>
-                <Text style={styles.sectionTitle}>Match overview</Text>
-                <Text style={styles.practiceAnalysisScore}>
-                  Overall match: {formatMatchScore(analysis.overall_score)}
-                </Text>
-                <Text style={styles.referenceListItemMeta}>
-                  {describeOverallMatch(analysis.overall_score)}
-                </Text>
-
-                <Text style={styles.practiceAnalysisScore}>
-                  Arms: {formatMatchScore(analysis.arms_score)}
-                </Text>
-                <Text style={styles.referenceListItemMeta}>
-                  {describeRegionMatch("arms", analysis.arms_score)}
-                </Text>
-
-                <Text style={styles.practiceAnalysisScore}>
-                  Legs: {formatMatchScore(analysis.legs_score)}
-                </Text>
-                <Text style={styles.referenceListItemMeta}>
-                  {describeRegionMatch("legs", analysis.legs_score)}
-                </Text>
-
-                <Text style={styles.practiceAnalysisScore}>
-                  Torso: {formatMatchScore(analysis.torso_score)}
-                </Text>
-                <Text style={styles.referenceListItemMeta}>
-                  {describeRegionMatch("torso", analysis.torso_score)}
-                </Text>
-              </View>
-
-              <View style={styles.summaryBox}>
-                <Text style={styles.sectionTitle}>Frames reviewed</Text>
-                <Text style={styles.referenceListItemMeta}>
-                  Usable comparison frames: {analysis.usable_comparison_frames}
-                </Text>
-                <Text style={styles.referenceListItemMeta}>
-                  Frames skipped (body not fully visible):{" "}
-                  {analysis.skipped_frames.partial_body}
-                </Text>
-                {analysis.skipped_frames.partial_body > 0 && (
-                  <Text style={styles.referenceListItemMeta}>
-                    Some frames were skipped because your full body was not
-                    visible.
-                  </Text>
-                )}
-                <Text style={styles.referenceListItemMeta}>
-                  Best moment:{" "}
-                  {analysis.best_moment
-                    ? `${formatDuration(analysis.best_moment.time_seconds)} (${analysis.best_moment.score}/100)`
-                    : "Not enough data"}
-                </Text>
-                <Text style={styles.referenceListItemMeta}>
-                  Needs work moment:{" "}
-                  {analysis.needs_work_moment
-                    ? `${formatDuration(analysis.needs_work_moment.time_seconds)} (${analysis.needs_work_moment.score}/100)`
-                    : "Not enough data"}
-                </Text>
-              </View>
-
-              <View style={styles.summaryBox}>
-                <Text style={styles.sectionTitle}>Tips</Text>
-                {analysisTips.map((tip) => (
-                  <Text key={tip} style={styles.practiceAnalysisTip}>
-                    • {tip}
-                  </Text>
-                ))}
-              </View>
-            </>
-          )}
+          <PracticeAnalysisReport
+            analysis={analysis}
+            stoppedEarly={stoppedEarly}
+          />
 
           <Pressable style={styles.button} onPress={handleTryAgain}>
             <Text style={styles.buttonText}>Try Again</Text>
@@ -2289,7 +2268,7 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
           key={loadedReference.referenceId}
           ref={musicPlayerRef}
           videoUrl={loadedReference.videoUrl}
-          onLoadStateChange={setMusicLoadState}
+          onLoadStateChange={handleMusicLoadStateChange}
           onPlaybackError={handleMusicPlaybackError}
           onPlayToEnd={handleMusicPlayToEnd}
         />
@@ -2345,6 +2324,15 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
           </View>
         )}
 
+        {sessionState === "starting_practice" && (
+          <View style={styles.practiceCountdownOverlay} pointerEvents="box-none">
+            <ActivityIndicator size="large" color="#fff" />
+            <Text style={styles.practiceCountdownMessage}>
+              Starting music…
+            </Text>
+          </View>
+        )}
+
         {sessionState === "practicing" && (
           <View style={styles.practiceTimerOverlay} pointerEvents="box-none">
             <Text style={styles.practiceTimerLabel}>Practice</Text>
@@ -2381,14 +2369,18 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
                     ? "Error"
                     : "Idle"}
             </Text>
-            <Text style={styles.practiceTimerMeta}>
-              Sampled frames: {sampledFrameCount}
-            </Text>
+            {livePoseSamplingWarning && (
+              <Text style={styles.practiceSamplingWarning}>
+                {livePoseSamplingWarning}
+              </Text>
+            )}
           </View>
         )}
 
         <View style={styles.practiceCameraOverlay} pointerEvents="box-none">
-          {sessionState !== "countdown" && sessionState !== "practicing" && (
+          {sessionState !== "countdown" &&
+            sessionState !== "starting_practice" &&
+            sessionState !== "practicing" && (
             <>
               <Text style={styles.practiceOverlayInstruction}>
                 Stand far enough back so your full body is visible.
@@ -2435,6 +2427,7 @@ function PracticeModeScreen({ onBack }: { onBack: () => void }) {
           )}
           {cameraReady &&
             sessionState !== "countdown" &&
+            sessionState !== "starting_practice" &&
             sessionState !== "practicing" && (
             <>
               <Text
@@ -3564,6 +3557,15 @@ const styles = StyleSheet.create({
   },
   practiceMusicStatusWarn: {
     color: "#ffe08a",
+  },
+  practiceSamplingWarning: {
+    marginTop: 8,
+    fontSize: 12,
+    lineHeight: 17,
+    color: "#ffe08a",
+    fontWeight: "600",
+    textAlign: "center",
+    maxWidth: 260,
   },
   practiceMusicError: {
     marginTop: 6,
